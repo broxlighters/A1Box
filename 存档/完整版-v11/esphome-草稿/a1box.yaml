@@ -1,0 +1,481 @@
+# =====================================================================
+#  A1BOX —— 拓竹 A1 打印机箱控制器（ESPHome 固件）
+#  主控：鹿小斑问天 ESP32C3-PRO（按通用 ESP32-C3 开发板处理）
+#  功能：照明 / 排风 / 内循环 / 12V 加热恒温 / 温湿度 / 门磁 / 安全保护
+#
+#  设计原则：
+#    1. 所有安全逻辑都在本板执行，Home Assistant 或 WiFi 断了照样生效
+#    2. 加热回路另有硬件过温保护（KSD301），不依赖本固件
+#    3. 引脚按普通 C3 板分配，拿到板子先对照丝印/引脚图核对（见 README）
+# =====================================================================
+
+substitutions:
+  name: a1box
+  friendly_name: A1BOX
+  # —— 安全参数，按需修改 ——
+  max_box_temp: "50"       # 箱温超过此值 → 进入故障：停加热 + 全速排风
+  max_heat_minutes: "60"   # 加热器连续通电超过此时间仍未到温 → 故障
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+logger:
+
+api:
+  encryption:
+    key: !secret api_key
+  # HA 不在线时不要自动重启：本地恒温和保护要一直工作
+  reboot_timeout: 0s
+
+ota:
+  - platform: esphome
+    encryption: {}   # 复用上面 api 的加密密钥
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "A1BOX-Setup"
+    password: !secret ap_password
+
+captive_portal:
+
+# 浏览器直接访问 http://a1box.local 也能控制（不依赖 HA）
+web_server:
+  port: 80
+  version: 3
+  ota: false   # 关闭网页上传固件，只允许加密 OTA
+
+globals:
+  # 恒温器"想要"加热（由 heat_action / idle_action 设置）
+  - id: heat_demand
+    type: bool
+    restore_value: false
+    initial_value: "false"
+  # 故障锁定：需要手动"清除故障"才能再次加热
+  - id: fault_active
+    type: bool
+    restore_value: false
+    initial_value: "false"
+
+# ---------------------------------------------------------------------
+#  I2C：SHT40 温湿度传感器
+# ---------------------------------------------------------------------
+i2c:
+  sda: GPIO4
+  scl: GPIO5
+  frequency: 100kHz
+
+sensor:
+  - platform: sht4x
+    update_interval: 5s
+    temperature:
+      id: box_temp
+      name: "Temperature"
+      filters:
+        - sliding_window_moving_average:
+            window_size: 3
+            send_every: 1
+        # 传感器掉线时 SHT4x 不会输出新值；30 秒没新数据就变成 NaN，
+        # 恒温器读到 NaN 会自动停止加热
+        - timeout: 30s
+      on_value:
+        then:
+          - script.execute: safety_check
+    humidity:
+      id: box_humidity
+      name: "Humidity"
+
+  # 排风扇转速：4 线风扇的 TACH 线，每转 2 个脉冲
+  - platform: pulse_counter
+    pin:
+      number: GPIO10
+      mode:
+        input: true
+        pullup: true
+    id: exhaust_rpm
+    name: "Exhaust RPM"
+    unit_of_measurement: "RPM"
+    use_pcnt: false            # ESP32-C3 没有硬件 PCNT，用软件中断计数
+    internal_filter: 100us
+    count_mode:
+      rising_edge: DISABLE
+      falling_edge: INCREMENT
+    filters:
+      - multiply: 0.5
+    update_interval: 10s
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+# ---------------------------------------------------------------------
+#  PWM 输出
+# ---------------------------------------------------------------------
+output:
+  # 灯带：经 MOSFET 低边驱动
+  - platform: ledc
+    pin: GPIO6
+    id: light_pwm
+    frequency: 1000Hz
+
+  # 排风扇 PWM 线：经 MOSFET 开漏驱动（MOSFET 导通 = 拉低），所以要反相
+  # 25kHz 是 4 线风扇的标准 PWM 频率
+  - platform: ledc
+    pin: GPIO7
+    id: exhaust_pwm
+    frequency: 25000Hz
+    inverted: true
+
+light:
+  - platform: monochromatic
+    output: light_pwm
+    id: box_light
+    name: "Light"
+    default_transition_length: 0.5s
+    restore_mode: RESTORE_DEFAULT_OFF
+
+fan:
+  - platform: speed
+    output: exhaust_pwm
+    id: exhaust_fan
+    name: "Exhaust Fan"
+    restore_mode: ALWAYS_OFF
+
+# ---------------------------------------------------------------------
+#  开关
+# ---------------------------------------------------------------------
+switch:
+  # 加热器继电器：GPIO3 → MOSFET → 汽车继电器线圈（线圈回路串 KSD301）
+  # internal: 不暴露给 HA，只能通过 heater_apply 脚本控制，避免绕过保护
+  - platform: gpio
+    pin: GPIO3
+    id: heater_relay
+    internal: true
+    restore_mode: ALWAYS_OFF
+    on_turn_on:
+      - script.execute: heater_watchdog
+    on_turn_off:
+      - script.stop: heater_watchdog
+
+  # 内循环风扇（让箱内温度均匀；加热时强制开启）
+  - platform: gpio
+    pin: GPIO1
+    id: circ_fan
+    name: "Circulation Fan"
+    restore_mode: ALWAYS_OFF
+
+# ---------------------------------------------------------------------
+#  二值传感器
+# ---------------------------------------------------------------------
+binary_sensor:
+  # 门磁：干簧管接 GPIO0 和 GND；门关上 = 闭合 = 低电平
+  # 线断了会读成"开门"→ 停止加热（失效安全）
+  - platform: gpio
+    pin:
+      number: GPIO0
+      mode:
+        input: true
+        pullup: true
+    id: door_open
+    name: "Door"
+    device_class: door
+    filters:
+      - delayed_on_off: 100ms
+    on_state:
+      then:
+        - script.execute: heater_apply
+
+  - platform: template
+    id: fault
+    name: "Fault"
+    device_class: problem
+    lambda: return id(fault_active);
+
+  # 排风扇开着（≥30%）但转速 < 100 RPM，持续 30 秒 → 提示停转
+  - platform: template
+    id: exhaust_stall
+    name: "Exhaust Stall"
+    device_class: problem
+    lambda: |-
+      return id(exhaust_fan).state &&
+             id(exhaust_fan).speed >= 30 &&
+             !std::isnan(id(exhaust_rpm).state) &&
+             id(exhaust_rpm).state < 100;
+    filters:
+      - delayed_on: 30s
+
+  - platform: status
+    name: "Status"
+
+# ---------------------------------------------------------------------
+#  恒温器（只制热，PA 用）
+#  恒温器只负责算"要不要加热"，真正开关继电器由 heater_apply 决定
+# ---------------------------------------------------------------------
+climate:
+  - platform: thermostat
+    id: box_heater
+    name: "Heater"
+    sensor: box_temp
+    visual:
+      min_temperature: 25
+      max_temperature: 45
+      temperature_step: 1
+    heat_deadband: 1.0
+    heat_overrun: 0.5
+    min_heating_off_time: 30s
+    min_heating_run_time: 30s
+    min_idle_time: 30s
+    heat_action:
+      - lambda: id(heat_demand) = true;
+      - script.execute: heater_apply
+    idle_action:
+      - lambda: id(heat_demand) = false;
+      - script.execute: heater_apply
+    heat_mode:
+      - switch.turn_on: circ_fan
+    off_mode:
+      - lambda: id(heat_demand) = false;
+      - script.execute: heater_apply
+    # 每次上电都回到"关闭"：停电恢复后不会自己开始加热
+    on_boot_restore_from: default_preset
+    default_preset: "PA"
+    preset:
+      - name: "PA"
+        default_target_temperature_low: 42
+        mode: "OFF"
+
+# ---------------------------------------------------------------------
+#  模式选择
+#    关闭       ：全部停
+#    PETG 打印  ：不加热；排风扇按箱温自动调速，把箱温压在上限以下
+#    PA 打印    ：加热到目标箱温，排风关闭
+#    打印后排风 ：全速排风 10 分钟后自动回到"关闭"
+# ---------------------------------------------------------------------
+select:
+  - platform: template
+    id: box_mode
+    name: "Mode"
+    optimistic: true
+    options:
+      - "关闭"
+      - "PETG 打印"
+      - "PA 打印"
+      - "打印后排风"
+    initial_option: "关闭"
+    restore_value: false
+    on_value:
+      then:
+        - script.stop: purge_timer
+        - script.stop: petg_fan_control
+        - lambda: ESP_LOGI("mode", "切换模式：%s", x.c_str());
+        - if:
+            condition:
+              lambda: return x == "PA 打印";
+            then:
+              - fan.turn_off: exhaust_fan
+              - switch.turn_on: circ_fan
+              - climate.control:
+                  id: box_heater
+                  mode: HEAT
+                  target_temperature: !lambda return id(pa_target).state;
+            else:
+              - climate.control:
+                  id: box_heater
+                  mode: "OFF"
+        - if:
+            condition:
+              lambda: return x == "关闭";
+            then:
+              - fan.turn_off: exhaust_fan
+              - switch.turn_off: circ_fan
+        - if:
+            condition:
+              lambda: return x == "PETG 打印";
+            then:
+              - switch.turn_on: circ_fan
+              - script.execute: petg_fan_control
+        - if:
+            condition:
+              lambda: return x == "打印后排风";
+            then:
+              - switch.turn_off: circ_fan
+              - fan.turn_on:
+                  id: exhaust_fan
+                  speed: 100
+              - script.execute: purge_timer
+
+number:
+  - platform: template
+    id: pa_target
+    name: "PA Target Temp"
+    unit_of_measurement: "°C"
+    min_value: 30
+    max_value: 45
+    step: 1
+    initial_value: 42
+    optimistic: true
+    restore_value: true
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: return id(box_heater).mode == climate::CLIMATE_MODE_HEAT;
+            then:
+              - climate.control:
+                  id: box_heater
+                  target_temperature: !lambda return x;
+
+  - platform: template
+    id: petg_max
+    name: "PETG Max Temp"
+    unit_of_measurement: "°C"
+    min_value: 25
+    max_value: 38
+    step: 1
+    initial_value: 33
+    optimistic: true
+    restore_value: true
+
+button:
+  - platform: template
+    name: "Clear Fault"
+    on_press:
+      - lambda: |-
+          id(fault_active) = false;
+          id(fault_reason).publish_state("正常");
+      - fan.turn_off: exhaust_fan
+      - switch.turn_off: circ_fan
+
+  - platform: restart
+    name: "Restart"
+
+text_sensor:
+  - platform: template
+    id: fault_reason
+    name: "Fault Reason"
+    update_interval: never
+
+# ---------------------------------------------------------------------
+#  脚本
+# ---------------------------------------------------------------------
+script:
+  # 唯一能打开加热继电器的地方：所有条件都满足才通电
+  - id: heater_apply
+    mode: queued
+    max_runs: 5
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(heat_demand) &&
+                     !id(fault_active) &&
+                     !id(door_open).state &&
+                     !std::isnan(id(box_temp).state) &&
+                     id(box_temp).state < ${max_box_temp};
+          then:
+            - switch.turn_on: circ_fan
+            - switch.turn_on: heater_relay
+          else:
+            - switch.turn_off: heater_relay
+
+  # 进入故障：停加热、模式切到关闭、全速排风、锁定
+  - id: enter_fault
+    mode: single
+    parameters:
+      reason: string
+    then:
+      - lambda: |-
+          ESP_LOGE("safety", "故障：%s", reason.c_str());
+          id(fault_active) = true;
+          id(fault_reason).publish_state(reason);
+      - switch.turn_off: heater_relay
+      - select.set:
+          id: box_mode
+          option: "关闭"
+      - fan.turn_on:
+          id: exhaust_fan
+          speed: 100
+      - switch.turn_on: circ_fan
+
+  # 每次温度更新时调用
+  - id: safety_check
+    mode: queued
+    max_runs: 3
+    then:
+      - if:
+          condition:
+            lambda: return !id(fault_active) && id(box_temp).state > ${max_box_temp};
+          then:
+            - script.execute:
+                id: enter_fault
+                reason: "箱温超过 ${max_box_temp}°C"
+
+  # 加热器连续通电过久仍未到温：可能加热器坏了、传感器脱落、门没关严
+  - id: heater_watchdog
+    mode: restart
+    then:
+      - delay: ${max_heat_minutes}min
+      - script.execute:
+          id: enter_fault
+          reason: "加热 ${max_heat_minutes} 分钟仍未到温"
+
+  # PETG 模式：按箱温比例调节排风
+  #   箱温 ≤ 上限-5°C：关；到上限：100%；中间线性 30%→100%
+  - id: petg_fan_control
+    mode: single
+    then:
+      - while:
+          condition:
+            lambda: return id(box_mode).current_option() == "PETG 打印";
+          then:
+            - lambda: |-
+                float t = id(box_temp).state;
+                float hi = id(petg_max).state;
+                float lo = hi - 5.0f;
+                if (std::isnan(t)) {
+                  // 读不到温度时保守地开 60%
+                  auto call = id(exhaust_fan).turn_on();
+                  call.set_speed(60);
+                  call.perform();
+                } else if (t <= lo) {
+                  if (id(exhaust_fan).state) id(exhaust_fan).turn_off().perform();
+                } else {
+                  int spd = (int) (30.0f + (t - lo) / (hi - lo) * 70.0f);
+                  if (spd > 100) spd = 100;
+                  auto call = id(exhaust_fan).turn_on();
+                  call.set_speed(spd);
+                  call.perform();
+                }
+            - delay: 15s
+
+  - id: purge_timer
+    mode: restart
+    then:
+      - delay: 10min
+      - select.set:
+          id: box_mode
+          option: "关闭"
+
+# ---------------------------------------------------------------------
+#  周期检查：加热模式下温度传感器失效 → 故障
+# ---------------------------------------------------------------------
+interval:
+  - interval: 10s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return !id(fault_active) &&
+                     id(box_heater).mode == climate::CLIMATE_MODE_HEAT &&
+                     std::isnan(id(box_temp).state);
+          then:
+            - script.execute:
+                id: enter_fault
+                reason: "温度传感器失效"

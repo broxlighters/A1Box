@@ -1,0 +1,474 @@
+# =====================================================================
+#  A1BOX —— 拓竹 A1 打印机箱控制器（ESPHome 固件）
+#  依据：REQUIREMENTS.md v13 定稿（2026-11-16）
+#  主控：鹿小斑问天 ESP32C3-PRO（按通用 ESP32-C3 开发板处理）
+#
+#  - 核心逻辑在 a1box_logic.h：模式、排风、超温、按键、联动。
+#    这个文件只负责把硬件和 HA 接到逻辑上。
+#  - 安全逻辑全部在本板执行，WiFi 或 HA 断开照样生效。
+#  - GPIO0 预留给第二阶段的加热器，第一版不配置。
+#  - 编译和烧录见 README.md。
+# =====================================================================
+
+substitutions:
+  name: a1box
+  friendly_name: A1BOX
+  light_pwm_freq: 1000Hz
+  fan_pwm_freq: 100Hz       # 两线风扇的 PWM 频率；实测有异响或调速不顺再改
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  includes:
+    - a1box_logic.h
+
+esp32:
+  board: esp32-c3-devkitm-1
+  framework:
+    type: esp-idf
+
+# 这块板子的 USB 口经过 CH340 转串口，接在 UART0（GPIO20/21）上，
+# 不是 C3 自带的 USB，所以日志要改走 UART0（C3 默认走自带 USB）
+logger:
+  hardware_uart: UART0
+
+# ---------------------------------------------------------------------
+#  HA 连接（加密）。下面三个动作给 HA 的打印机联动自动化调用（REQUIREMENTS 4.6）
+# ---------------------------------------------------------------------
+api:
+  encryption:
+    key: !secret api_key
+  reboot_timeout: 0s        # 连不上 HA 也不重启，本地功能照常
+  actions:
+    # 开始打印：开灯，先按 PETG 处理，清掉上一次打印的「手动优先」
+    - action: print_started
+      then:
+        - lambda: a1box::ctrl.on_print_started(millis());
+        - light.turn_on: box_light
+        - script.execute: refresh
+
+    # 当前耗材类型（如 PA-CF）：PA 类就切到 PA；本次打印手动改过模式则不动
+    - action: print_material
+      variables:
+        material: string
+      then:
+        - lambda: a1box::ctrl.on_print_material(material, millis());
+        - script.execute: refresh
+
+    # 打印完成、失败或取消：进入打印后排风，走完后关灯
+    - action: print_finished
+      then:
+        - lambda: a1box::ctrl.on_print_finished(millis());
+        - script.execute: refresh
+
+ota:
+  - platform: esphome
+    encryption: {}          # 和 api 用同一个密钥加密
+
+wifi:
+  id: wifi_comp
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  reboot_timeout: 0s        # 默认断网 15 分钟会重启，重启会丢掉模式和灯的状态，关掉
+  ap:                       # 连不上 WiFi 时开热点，用来重新配网
+    ssid: "A1BOX-Setup"
+    password: !secret ap_password
+
+captive_portal:
+
+# ---------------------------------------------------------------------
+#  I2C：SHT40（0x44）和板载小屏（0x3C，SSD1312）共用。
+#  400kHz 是厂家给小屏用的速率，刷一屏约 25ms；100kHz 要 90ms 左右，会卡住主循环。
+#  SHT40 接上后如果读数时有时无，先把这里降回 100kHz 试试。
+# ---------------------------------------------------------------------
+i2c:
+  sda: GPIO5
+  scl: GPIO6
+  frequency: 400kHz
+  scan: true
+
+# ---------------------------------------------------------------------
+#  板载小屏（REQUIREMENTS 4.10）：0.96 寸 128×64，驱动 SSD1312。
+#  ESPHome 没有 SSD1312 型号，按兼容的 SSD1306 驱动。
+#  只在按键后亮 30 秒，任何时候都不常亮，报警也不例外（见 screen 脚本）。
+# ---------------------------------------------------------------------
+font:
+  # 英文和数字用 Liberation Sans（OFL），中文从 Droid Sans Fallback（Apache 2.0）补上。
+  # 两个都是系统自带字体，拷在 fonts/ 里。只编进用得到的字。
+  - file: fonts/LiberationSans-Regular.ttf
+    id: font_cn
+    size: 14
+    bpp: 1
+    glyphs:
+      - " %+-./0123456789:°ACEGIPTWi"
+    extras:
+      - file: fonts/DroidSansFallbackFull.ttf
+        glyphs:
+          - "关闭打印后排风分灯开箱温过高传感器失效未连接模式"
+
+display:
+  - platform: ssd1306_i2c
+    id: oled
+    model: "SSD1306 128x64"
+    address: 0x3C
+    flip_x: false              # SSD1312 按 SSD1306 驱动时左右是反的（2026-11-20 实测）
+    update_interval: never     # 只在亮屏时由 screen 脚本刷新
+    lambda: |-
+      auto &c = a1box::ctrl;
+      const uint32_t now = millis();
+      static const char *const MODE_NAMES[] = {"关闭", "PETG", "PA", "打印后排风"};
+      auto *f = id(font_cn);
+
+      // 第 1 行：模式；打印后排风本身看得懂，不加「模式」，带剩余分钟
+      if (c.mode() == a1box::Mode::PURGE) {
+        const uint32_t min_left = (c.purge_remaining_ms(now) + 59999) / 60000;
+        it.printf(0, 0, f, "打印后排风 %u分", (unsigned) min_left);
+      } else {
+        it.printf(0, 0, f, "模式 %s", MODE_NAMES[static_cast<int>(c.mode())]);
+      }
+
+      // 第 2 行：箱温、湿度；没有数据时显示 --
+      const float t = id(box_temp_raw).state;
+      const float h = id(box_humidity_raw).state;
+      const bool ok = !c.sensor_stale();
+      char tbuf[12], hbuf[8];
+      if (ok && !std::isnan(t)) snprintf(tbuf, sizeof(tbuf), "%.1f°C", t); else snprintf(tbuf, sizeof(tbuf), "--°C");
+      if (ok && !std::isnan(h)) snprintf(hbuf, sizeof(hbuf), "%.0f%%", h); else snprintf(hbuf, sizeof(hbuf), "--%%");
+      it.printf(0, 16, f, "%s  %s", tbuf, hbuf);
+
+      // 第 3 行：排风速度、灯
+      it.printf(0, 32, f, "排风 %.0f%%  灯 %s", c.fan_target_pct(),
+                id(box_light).remote_values.is_on() ? "开" : "关");
+
+      // 第 4 行：报警优先（两个都有就每 2 秒轮流），没有报警显示 IP
+      const bool ot = c.overtemp();
+      const bool st = c.sensor_stale();
+      if (ot && st) {
+        it.print(0, 48, f, (now / 2000) % 2 ? "传感器失效" : "箱温过高");
+      } else if (ot) {
+        it.print(0, 48, f, "箱温过高");
+      } else if (st) {
+        it.print(0, 48, f, "传感器失效");
+      } else if (id(wifi_comp).is_connected()) {
+        it.print(0, 48, f, id(ip_addr).state.c_str());
+      } else {
+        it.print(0, 48, f, "WiFi 未连接");
+      }
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      id: ip_addr
+      internal: true            # 只给小屏用
+
+# ---------------------------------------------------------------------
+#  PWM 输出：都是 MOSFET 模块低边驱动，高电平导通
+# ---------------------------------------------------------------------
+output:
+  - platform: ledc
+    id: light_pwm
+    pin: GPIO1
+    frequency: ${light_pwm_freq}
+
+  - platform: ledc
+    id: fan_pwm
+    pin: GPIO3
+    frequency: ${fan_pwm_freq}
+
+  # 板载绿灯（GPIO7），状态指示，逻辑见 interval 里的 green_led。
+  # 板载红灯是电源指示灯，直接接电源，固件控制不了。
+  - platform: gpio
+    id: green_led
+    pin: GPIO7
+
+light:
+  - platform: monochromatic
+    id: box_light
+    name: "Light"
+    output: light_pwm
+    restore_mode: ALWAYS_OFF          # 上电时灯是关的
+    default_transition_length: 0.5s
+    on_state:
+      - lambda: a1box::ctrl.on_light_changed();
+
+# ---------------------------------------------------------------------
+#  传感器
+# ---------------------------------------------------------------------
+sensor:
+  # 原始读数每 5 秒一次，只给本地逻辑用（超温、PETG 调速、失效检测）
+  - platform: sht4x
+    update_interval: 5s
+    temperature:
+      id: box_temp_raw
+      internal: true
+      on_value:
+        - lambda: a1box::ctrl.on_temperature(x, millis());
+        - script.execute: refresh
+    humidity:
+      id: box_humidity_raw
+      internal: true
+
+  # 发给 HA 的箱温和湿度：变化够大才发，否则最多 5 分钟发一次。
+  # 树莓派用 SD 卡，这样可以少写很多历史记录。
+  - platform: copy
+    source_id: box_temp_raw
+    name: "Temperature"
+    accuracy_decimals: 1
+    filters:
+      - or:
+          - delta: 0.2
+          - throttle: 300s
+
+  - platform: copy
+    source_id: box_humidity_raw
+    name: "Humidity"
+    accuracy_decimals: 0
+    filters:
+      - or:
+          - delta: 1.0
+          - throttle: 300s
+
+  - platform: template
+    id: fan_speed
+    name: "Exhaust Speed"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    icon: mdi:fan
+    update_interval: never
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 300s
+    entity_category: diagnostic
+
+# ---------------------------------------------------------------------
+#  按键和报警
+# ---------------------------------------------------------------------
+binary_sensor:
+  # 按键 1：开关灯。和板载 BOOT 键是同一个引脚，开机时按住会进入烧录模式
+  - platform: gpio
+    id: button1
+    internal: true
+    pin:
+      number: GPIO9
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+      ignore_strapping_warning: true
+    filters:
+      - delayed_on: 30ms
+      - delayed_off: 30ms
+    on_press:
+      - light.toggle: box_light
+      - lambda: a1box::ctrl.on_any_button(millis());
+      - script.execute: screen
+
+  # 按键 2：「关闭」时全速排风 10 分钟；其他模式下停止；超温排风也能停
+  - platform: gpio
+    id: button2
+    internal: true
+    pin:
+      number: GPIO10
+      mode:
+        input: true
+        pullup: true
+      inverted: true
+    filters:
+      - delayed_on: 30ms
+      - delayed_off: 30ms
+    on_press:
+      - lambda: |-
+          a1box::ctrl.on_button2(millis());
+          a1box::ctrl.on_any_button(millis());
+      - script.execute: refresh
+      - script.execute: screen
+
+  # 箱温超过 50°C 时为「有问题」，降到 45°C 以下恢复。HA 据此推送报警
+  - platform: template
+    id: overtemp_alarm
+    name: "Overtemp"
+    device_class: problem
+
+  # 温湿度传感器 30 秒没有新数据时为「有问题」
+  - platform: template
+    id: sensor_fault
+    name: "Sensor Fault"
+    device_class: problem
+
+  - platform: status
+    name: "Status"
+
+# ---------------------------------------------------------------------
+#  模式（REQUIREMENTS 4.5）。选项顺序和 a1box_logic.h 里的 Mode 一一对应
+# ---------------------------------------------------------------------
+select:
+  - platform: template
+    id: box_mode
+    name: "Mode"
+    options:
+      - "关闭"
+      - "PETG"
+      - "PA"
+      - "打印后排风"
+    initial_option: "关闭"
+    optimistic: false
+    set_action:
+      - lambda: |-
+          auto idx = id(box_mode).index_of(x.c_str(), x.size());
+          if (idx.has_value())
+            a1box::ctrl.on_ha_mode(static_cast<a1box::Mode>(*idx), millis());
+      - script.execute: refresh
+
+# ---------------------------------------------------------------------
+#  可调参数
+# ---------------------------------------------------------------------
+number:
+  - platform: template
+    id: petg_limit
+    name: "PETG Max Temp"
+    icon: mdi:thermometer-high
+    unit_of_measurement: "°C"
+    min_value: 25
+    max_value: 38
+    step: 1
+    initial_value: 33
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - script.execute: refresh
+
+  - platform: template
+    id: purge_minutes
+    name: "Purge Duration"
+    icon: mdi:timer-outline
+    unit_of_measurement: "min"
+    min_value: 1
+    max_value: 60
+    step: 1
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - script.execute: refresh
+
+  # 两线风扇能稳定转动的最低占空比，用下面的「风扇测试」实测后填（待定 3）
+  - platform: template
+    id: fan_min_duty
+    name: "Fan Min Duty"
+    entity_category: config
+    icon: mdi:fan-chevron-down
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 80
+    step: 1
+    initial_value: 30
+    optimistic: true
+    restore_value: true
+    mode: box
+    on_value:
+      - script.execute: refresh
+
+  # 风扇测试：只在「关闭」模式下生效，直接按这个占空比转，不做启动冲击。
+  # 切换模式、按按键 2、重启都会归零。
+  - platform: template
+    id: fan_test
+    name: "Fan Test Duty"
+    entity_category: config
+    icon: mdi:fan-alert
+    unit_of_measurement: "%"
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 0
+    optimistic: false
+    restore_value: false
+    mode: slider
+    set_action:
+      - lambda: a1box::ctrl.set_fan_test_pct(x);
+      - script.execute: refresh
+
+button:
+  - platform: restart
+    name: "Restart"
+    entity_category: config
+
+# ---------------------------------------------------------------------
+#  同步：把逻辑的结果写到 PWM、灯和 HA 实体上。
+#  每 0.5 秒跑一次，按键、温度、HA 操作之后也立即跑一次。
+# ---------------------------------------------------------------------
+script:
+  - id: refresh
+    then:
+      - lambda: |-
+          auto &c = a1box::ctrl;
+          const uint32_t now = millis();
+
+          // 1. HA 上的可调参数
+          if (!std::isnan(id(petg_limit).state)) c.set_petg_limit(id(petg_limit).state);
+          if (!std::isnan(id(purge_minutes).state))
+            c.purge_ms = static_cast<uint32_t>(id(purge_minutes).state * 60000.0f);
+          if (!std::isnan(id(fan_min_duty).state)) c.fan_min_pct = id(fan_min_duty).state;
+
+          // 2. 计时：传感器超时、打印后排风到点
+          c.tick(now);
+
+          // 3. 风扇
+          id(fan_pwm).set_level(c.fan_duty(now));
+
+          // 4. 打印后排风正常走完、期间没人动过灯：关灯
+          if (c.take_light_off_request()) {
+            auto call = id(box_light).turn_off();
+            call.perform();
+          }
+
+          // 5. 状态同步到 HA（只在变化时发）
+          const size_t mode_idx = static_cast<size_t>(c.mode());
+          const auto cur = id(box_mode).active_index();
+          if (!id(box_mode).has_state() || !cur.has_value() || *cur != mode_idx)
+            id(box_mode).publish_state(mode_idx);
+
+          const float spd = roundf(c.fan_target_pct());
+          if (id(fan_speed).state != spd) id(fan_speed).publish_state(spd);
+
+          id(overtemp_alarm).publish_state(c.overtemp());
+          id(sensor_fault).publish_state(c.sensor_stale());
+
+          if (id(fan_test).state != c.fan_test_pct()) id(fan_test).publish_state(c.fan_test_pct());
+
+  # 板载小屏：该亮就开屏并重画，该熄就关屏（REQUIREMENTS 4.10）
+  - id: screen
+    then:
+      - lambda: |-
+          if (a1box::ctrl.screen_on(millis())) {
+            if (!id(oled).is_on()) id(oled).turn_on();
+            id(oled).update();
+          } else if (id(oled).is_on()) {
+            id(oled).turn_off();
+          }
+
+interval:
+  - interval: 500ms
+    then:
+      - script.execute: refresh
+  - interval: 1s
+    then:
+      - script.execute: screen
+
+  # 板载绿灯：常亮 = 正常，快闪 = 有组件故障，慢闪 = 警告（如 WiFi 断开）。
+  # 上电后先常亮约 3 秒做灯检。闪法和 ESPHome 自带的状态灯一致，只是正常时改成常亮。
+  - interval: 50ms
+    then:
+      - lambda: |-
+          static bool lamp_test_done = false;
+          const uint32_t now = millis();
+          if (!lamp_test_done && now >= 4000) lamp_test_done = true;
+          const uint8_t st = App.get_app_state();
+          bool on;
+          if (!lamp_test_done) on = true;
+          else if (st & STATUS_LED_ERROR) on = now % 250 < 150;
+          else if (st & STATUS_LED_WARNING) on = now % 1500 < 250;
+          else on = true;
+          if (on) id(green_led).turn_on(); else id(green_led).turn_off();

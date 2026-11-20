@@ -1,0 +1,48 @@
+# A1BOX 仪表盘卡片（REQUIREMENTS 4.8）
+# 用法：HA 仪表盘 → 右上角编辑 → 添加卡片 → 拉到最下面选「手动」→ 整段粘进去。
+# 粘之前把 a1_printer 换成打印机的实体前缀（见 README.md 第 3 步）。
+type: vertical-stack
+cards:
+  # A1 自带摄像头的画面（在家里 WiFi 才能看）
+  - type: picture-entity
+    entity: camera.a1_printer_camera
+    camera_view: auto
+    show_name: false
+    show_state: false
+
+  # 开关灯、调亮度
+  - type: tile
+    entity: light.a1box_light
+    name: 箱灯
+    features:
+      - type: light-brightness
+
+  - type: entities
+    title: A1BOX
+    entities:
+      - entity: select.a1box_mode
+        name: 模式
+      - entity: sensor.a1box_temperature
+        name: 箱温
+      - entity: sensor.a1box_humidity
+        name: 湿度
+      - entity: sensor.a1box_exhaust_speed
+        name: 排风速度
+      - entity: binary_sensor.a1box_overtemp
+        name: 箱温过高
+      - entity: binary_sensor.a1box_sensor_fault
+        name: 温湿度传感器
+      - type: divider
+      - entity: number.a1box_petg_max_temp
+        name: PETG 箱温上限
+      - entity: number.a1box_purge_duration
+        name: 打印后排风时长
+
+  - type: history-graph
+    title: 箱温和湿度（24 小时）
+    hours_to_show: 24
+    entities:
+      - entity: sensor.a1box_temperature
+        name: 箱温
+      - entity: sensor.a1box_humidity
+        name: 湿度

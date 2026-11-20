@@ -1,0 +1,17 @@
+# 密钥：WiFi 密码、加密密钥。任何目录下的 secrets.yaml 都不进 git。
+# 模板见 esphome/secrets.example.yaml
+secrets.yaml
+
+# ESPHome 编译产物
+.esphome/
+
+# 原作者的模型文件：MakerWorld 独家许可，不是本项目的成果，而且体积大（300 多 MB）
+/Al封箱pro.3mf
+/Al封箱pro_STEP/
+/Al封箱pro_分盘/
+
+# 第三方代码：ha-bambulab 是单独 clone 的仓库，需要时重新 clone 即可
+/ha-bambulab/
+
+# 切片工具的输出
+/result.json

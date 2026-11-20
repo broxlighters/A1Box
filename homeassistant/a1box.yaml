@@ -1,0 +1,167 @@
+# =====================================================================
+#  A1BOX —— Home Assistant 配置包（打印机联动 + 推送）
+#  依据：REQUIREMENTS.md v13 定稿 4.6、4.8
+#  2026-11-16 对照 ha-bambulab v2.4.0 源码核对过事件和实体名。
+#
+#  装好后只需要替换两类占位（见 README.md 第 3、4 步）：
+#    a1_printer          → a1_ 加打印机序列号（小写），如 a1_0309ca123456789
+#    mobile_app_phone    → 手机的通知服务名
+#
+#  分工：
+#    - 主控只管本地逻辑（模式、排风、超温、按键），不依赖 HA。
+#    - 这里只做两件事：把打印机的事件告诉主控（三个 esphome.a1box_print_* 动作），
+#      以及推送通知。HA 或打印机离线时联动自然停止，本地功能不受影响。
+# =====================================================================
+
+homeassistant:
+  customize:
+    light.a1box_light:
+      friendly_name: 箱灯
+    select.a1box_mode:
+      friendly_name: 箱子模式
+    sensor.a1box_temperature:
+      friendly_name: 箱温
+    sensor.a1box_humidity:
+      friendly_name: 箱内湿度
+    sensor.a1box_exhaust_speed:
+      friendly_name: 排风速度
+    binary_sensor.a1box_overtemp:
+      friendly_name: 箱温过高
+    binary_sensor.a1box_sensor_fault:
+      friendly_name: 温湿度传感器故障
+    binary_sensor.a1box_status:
+      friendly_name: 主控在线
+    number.a1box_petg_max_temp:
+      friendly_name: PETG 箱温上限
+    number.a1box_purge_duration:
+      friendly_name: 打印后排风时长
+
+script:
+  # 所有推送都走这里，换手机只改这一处
+  a1box_notify:
+    alias: A1BOX 推送
+    mode: queued
+    fields:
+      title:
+        description: 标题
+      message:
+        description: 正文
+      image:
+        description: 图片地址（可选）
+    sequence:
+      - action: notify.mobile_app_phone        # ← 改成你的手机
+        data:
+          title: "{{ title }}"
+          message: "{{ message }}"
+          data: "{{ {'image': image} if image is defined and image else {} }}"
+
+automation:
+  # -------------------------------------------------------------------
+  #  联动：开始打印（4.6）
+  #  ha-bambulab 只在打印机从空闲、完成或失败状态进入打印时发 event_print_started。
+  #  暂停后恢复、HA 重启、打印机重新上线都不会发，所以不会重复开灯、改模式。
+  #
+  #  先通知主控开灯、按 PETG 处理；等第一层真正开打再把料盘的耗材类型发过去。
+  #  那时调平、换料都已经做完，料盘一定是本次打印用的料。PA 类由主控切到 PA。
+  #  打印期间手动改过模式的话，主控会忽略耗材类型。
+  # -------------------------------------------------------------------
+  - id: a1box_print_started
+    alias: A1BOX 联动：开始打印
+    mode: restart
+    triggers:
+      - trigger: event
+        event_type: bambu_lab_event
+        event_data:
+          type: event_print_started
+    actions:
+      - action: esphome.a1box_print_started
+      - wait_template: >
+          {{ is_state('sensor.a1_printer_current_stage', 'printing')
+             and states('sensor.a1_printer_current_layer') | int(0) >= 1 }}
+        timeout: "00:30:00"
+        continue_on_timeout: true
+      - action: esphome.a1box_print_material
+        data:
+          material: "{{ state_attr('sensor.a1_printer_active_tray', 'type') | default('', true) }}"
+
+  # -------------------------------------------------------------------
+  #  联动：打印完成、失败或取消（4.6）→ 打印后排风，走完后主控自己关灯。
+  #  取消时可能先后来「取消」和「失败」两个事件，主控对第二个不重新计时。
+  # -------------------------------------------------------------------
+  - id: a1box_print_finished
+    alias: A1BOX 联动：打印结束
+    mode: queued
+    triggers:
+      - trigger: event
+        event_type: bambu_lab_event
+        event_data:
+          type: event_print_finished
+      - trigger: event
+        event_type: bambu_lab_event
+        event_data:
+          type: event_print_failed
+      - trigger: event
+        event_type: bambu_lab_event
+        event_data:
+          type: event_print_canceled
+    actions:
+      - action: esphome.a1box_print_finished
+
+  # -------------------------------------------------------------------
+  #  推送（4.8）。截图和画面要在家里 WiFi 才能看到，文字在外面也能收到。
+  # -------------------------------------------------------------------
+  - id: a1box_notify_print_done
+    alias: A1BOX 推送：打印完成
+    triggers:
+      - trigger: event
+        event_type: bambu_lab_event
+        event_data:
+          type: event_print_finished
+    actions:
+      - action: script.a1box_notify
+        data:
+          title: 打印完成
+          message: "{{ states('sensor.a1_printer_task_name') }} 打印完成，箱子正在排风。"
+          image: /api/camera_proxy/camera.a1_printer_camera
+
+  - id: a1box_notify_overtemp
+    alias: A1BOX 推送：箱温过高
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.a1box_overtemp
+        from: "off"
+        to: "on"
+    actions:
+      - action: script.a1box_notify
+        data:
+          title: A1BOX 箱温过高
+          message: >
+            箱温 {{ states('sensor.a1box_temperature') }}°C，超过 50°C，已全速排风。
+            降到 45°C 以下自动恢复；按箱子上的按键 2 可以停掉排风。
+
+  - id: a1box_notify_sensor_fault
+    alias: A1BOX 推送：温湿度传感器失效
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.a1box_sensor_fault
+        from: "off"
+        to: "on"
+    actions:
+      - action: script.a1box_notify
+        data:
+          title: A1BOX 温湿度传感器失效
+          message: 30 秒没有收到温湿度数据，请检查 SHT40 接线。PETG 模式下排风已固定开到 60%。
+
+  - id: a1box_notify_offline
+    alias: A1BOX 推送：主控掉线
+    triggers:
+      - trigger: state
+        entity_id: binary_sensor.a1box_status
+        from: "on"
+        to: [unavailable, "off"]
+        for: "00:02:00"
+    actions:
+      - action: script.a1box_notify
+        data:
+          title: A1BOX 主控掉线
+          message: 主控已离线 2 分钟。箱子上的按键和超温保护不受影响，但手机控制和打印机联动暂停。
